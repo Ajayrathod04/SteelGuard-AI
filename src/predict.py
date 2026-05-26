@@ -84,27 +84,32 @@ def run_predictions():
     # 3. Apply Optimized Threshold
     test_binary_predictions = (accumulated_test_probs >= threshold).astype(int)
     
-    # 4. Map predictions to exact order of sample_submission
-    # Create a mapping of CoilID -> Prediction
-    prediction_map = dict(zip(df_test[ID_COL], test_binary_predictions))
-    
-    # Check if there are any missing CoilIDs in our test predictions compared to sample_submission
-    missing_ids = set(df_sample_sub[ID_COL]) - set(prediction_map.keys())
-    if missing_ids:
-        logger.warning(f"Found {len(missing_ids)} CoilIDs in sample_submission that were missing in test.csv! Filling with 0.")
-        for mid in missing_ids:
-            prediction_map[mid] = 0
-            
-    # Construct final submission DataFrame following exact sample_submission ordering
+    # 4. Construct final submission DataFrame following exact test.csv ordering
     df_submission = pd.DataFrame({
-        ID_COL: df_sample_sub[ID_COL],
-        TARGET_COL: [prediction_map[cid] for cid in df_sample_sub[ID_COL]]
+        ID_COL: df_test[ID_COL],
+        TARGET_COL: test_binary_predictions
     })
     
-    # 5. Verify constraints
-    assert len(df_submission) == len(df_sample_sub), "Row count does not match sample submission!"
-    assert list(df_submission.columns) == list(df_sample_sub.columns), "Columns do not match sample submission!"
-    assert (df_submission[ID_COL] == df_sample_sub[ID_COL]).all(), "CoilID ordering does not match sample submission!"
+    # 5. Automated Validation & Constraints Check
+    if len(df_submission) != 339:
+        raise ValueError(f"CRITICAL ERROR: Expected exactly 339 rows in submission, but generated {len(df_submission)}.")
+    
+    expected_cols = [ID_COL, TARGET_COL]
+    if list(df_submission.columns) != expected_cols:
+        raise ValueError(f"CRITICAL ERROR: Columns do not match expected schema {expected_cols}. Got {list(df_submission.columns)}.")
+        
+    if df_submission.isnull().any().any():
+        raise ValueError("CRITICAL ERROR: Submission contains null values!")
+        
+    unique_preds = set(df_submission[TARGET_COL].unique())
+    if not unique_preds.issubset({0, 1}):
+        raise ValueError(f"CRITICAL ERROR: Invalid prediction values found: {unique_preds}. Must only contain 0 or 1.")
+        
+    logger.success("Submission validation passed:")
+    logger.success("[OK] Rows = 339")
+    logger.success("[OK] Columns correct")
+    logger.success("[OK] No null values")
+    logger.success("[OK] Ready for HackerEarth upload")
     
     # 6. Save final submission
     sub_output_path = os.path.join(SUBMISSIONS_DIR, 'expected_submission.csv')
