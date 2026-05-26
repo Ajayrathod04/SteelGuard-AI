@@ -1,0 +1,27 @@
+# Python cached files
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+*$py.class
+
+# Models and Serialization
+*.pkl
+*.joblib
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# System & IDEs
+.DS_Store
+.vscode/
+.idea/
+
+# Local Artifacts & Output
+artifacts/
+data/*.csv
+data/*.xlsx
+submissions/*.csv
+plots/*.png
+catboost_info/
