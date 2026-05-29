@@ -3,12 +3,12 @@ import pandas as pd
 import numpy as np
 import joblib
 
-from config import DATA_DIR, MODELS_DIR, SUBMISSIONS_DIR, TARGET_COL, ID_COL, N_SPLITS, N_REPEATS
+from config import DATA_DIR, MODELS_DIR, SUBMISSIONS_DIR, TARGET_COL, ID_COL, N_SPLITS
 from utils import SimpleLogger, load_model
 
 def run_predictions():
     logger = SimpleLogger("SteelGuard-AI-Prediction")
-    logger.info("Initializing Elite Prediction Pipeline...")
+    logger.info("Initializing Stability-Hardened Inference Pipeline...")
     
     # 1. Load Test Data
     test_path = os.path.join(DATA_DIR, 'test.csv')
@@ -29,59 +29,53 @@ def run_predictions():
     weights = metadata['weights']
     threshold = metadata['threshold']
     models_list = metadata['models_list']
+    oof_metrics = metadata['metrics']
     
-    logger.info(f"Loaded ensemble metadata. Models weights: {weights}")
-    logger.info(f"Loaded decision threshold: {threshold:.4f}")
-    
-    # Load primary feature names (original columns before FE)
-    train_path = os.path.join(DATA_DIR, 'train.csv')
-    df_train_raw = pd.read_csv(train_path)
-    primary_features = [col for col in df_train_raw.columns if col not in [ID_COL, TARGET_COL]]
-    
-    # Final features expected by model (engineered features)
-    final_features = joblib.load(os.path.join(MODELS_DIR, 'final_features.joblib'))
+    logger.info(f"Loaded stability-hardened ensemble metadata.")
+    logger.info(f"  Optimized Weights: {weights}")
+    logger.info(f"  OOF Optimized Penalized Threshold: {threshold:.5f}")
     
     # Array to accumulate probabilities for all test samples
-    # We will average over 25 splits (5 folds x 5 repeats)
     accumulated_test_probs = np.zeros(len(df_test))
     
-    total_splits = N_SPLITS * N_REPEATS
-    logger.info(f"Performing leakage-free, fold-consistent test predictions across {total_splits} splits...")
+    logger.info(f"Performing leak-free fold-bagged predictions with adaptive feature selection across {N_SPLITS} splits...")
     
-    for rep in range(N_REPEATS):
-        for fold in range(N_SPLITS):
-            # A. Load preprocessor and feature engineer for this split
-            preproc_path = os.path.join(MODELS_DIR, f"preprocessor_fold_{fold}_rep_{rep}.joblib")
-            eng_path = os.path.join(MODELS_DIR, f"feature_engineer_fold_{fold}_rep_{rep}.joblib")
+    for fold in range(N_SPLITS):
+        # A. Load preprocessor, feature engineer, and selected features list for this fold
+        preproc_path = os.path.join(MODELS_DIR, f"preprocessor_fold_{fold}_rep_0.joblib")
+        eng_path = os.path.join(MODELS_DIR, f"feature_engineer_fold_{fold}_rep_0.joblib")
+        mask_path = os.path.join(MODELS_DIR, f"selected_features_fold_{fold}.joblib")
+        
+        preprocessor = load_model(preproc_path)
+        engineer = load_model(eng_path)
+        selected_features = joblib.load(mask_path)
+        
+        # B. Preprocess and feature engineer test data
+        df_test_proc = preprocessor.transform(df_test)
+        df_test_eng = engineer.transform(df_test_proc)
+        
+        # Filter features to keep only top 85% cumulative importance of this fold
+        X_test_sel = df_test_eng[selected_features].values
+        
+        # C. Predict probability with each model, weighted by its optimized weight
+        split_prob_blend = np.zeros(len(df_test))
+        
+        for model_name in models_list:
+            model_path = os.path.join(MODELS_DIR, f"{model_name}_fold_{fold}_rep_0.joblib")
+            model = load_model(model_path)
             
-            preprocessor = load_model(preproc_path)
-            engineer = load_model(eng_path)
+            # Predict probabilities
+            model_probs = model.predict_proba(X_test_sel)[:, 1]
             
-            # B. Preprocess and feature engineer test data
-            df_test_proc = preprocessor.transform(df_test)
-            df_test_eng = engineer.transform(df_test_proc)
+            # Weighted contribution
+            split_prob_blend += weights[model_name] * model_probs
             
-            X_test = df_test_eng[final_features].values
-            
-            # C. Predict probability with each model, weighted by its optimized weight
-            split_prob_blend = np.zeros(len(df_test))
-            
-            for model_name in models_list:
-                model_path = os.path.join(MODELS_DIR, f"{model_name}_fold_{fold}_rep_{rep}.joblib")
-                model = load_model(model_path)
-                
-                # Predict probabilities
-                model_probs = model.predict_proba(X_test)[:, 1]
-                
-                # Weighted contribution
-                split_prob_blend += weights[model_name] * model_probs
-                
-            # Accumulate this split's predictions
-            accumulated_test_probs += split_prob_blend / total_splits
-            
-    logger.success(f"Test predictions accumulated and averaged across {total_splits} splits!")
+        # Accumulate this split's predictions
+        accumulated_test_probs += split_prob_blend / N_SPLITS
+        
+    logger.success(f"Test predictions ensembled and bagged across {N_SPLITS} splits!")
     
-    # 3. Apply Optimized Threshold
+    # 3. Apply Optimized Threshold (No hard positive capping/clipping)
     test_binary_predictions = (accumulated_test_probs >= threshold).astype(int)
     
     # 4. Construct final submission DataFrame following exact test.csv ordering
@@ -106,23 +100,50 @@ def run_predictions():
         raise ValueError(f"CRITICAL ERROR: Invalid prediction values found: {unique_preds}. Must only contain 0 or 1.")
         
     logger.success("Submission validation passed:")
-    logger.success("[OK] Rows = 339")
-    logger.success("[OK] Columns correct")
-    logger.success("[OK] No null values")
-    logger.success("[OK] Ready for HackerEarth upload")
+    logger.success("  [OK] Rows = 339")
+    logger.success("  [OK] Columns correct")
+    logger.success("  [OK] No null values")
+    logger.success("  [OK] Binary predictions only")
     
-    # 6. Save final submission
+    # 6. Save final submission (Force update to both paths for VS Code caching)
     sub_output_path = os.path.join(SUBMISSIONS_DIR, 'expected_submission.csv')
     df_submission.to_csv(sub_output_path, index=False)
     logger.success(f"Final competition submission saved to {sub_output_path}")
     
-    # 7. Print prediction statistics
+    # Force save to both D: and d: to reload open tabs in VS Code
+    for drive in ['d', 'D']:
+        alt_path = sub_output_path.replace('d:', f'{drive}:').replace('D:', f'{drive}:')
+        try:
+            os.makedirs(os.path.dirname(alt_path), exist_ok=True)
+            df_submission.to_csv(alt_path, index=False)
+            logger.info(f"Synchronized submission to: {alt_path}")
+        except Exception:
+            pass
+            
+    # 7. Print prediction and optimization statistics
     predicted_counts = df_submission[TARGET_COL].value_counts()
-    logger.info("Final Submission Statistics:")
-    logger.info(f"  Total test samples    : {len(df_submission)}")
-    logger.info(f"  Predicted Normal (0)  : {predicted_counts.get(0, 0)}")
-    logger.info(f"  Predicted Defect (1)  : {predicted_counts.get(1, 0)}")
-    logger.info(f"  Predicted Defect Rate : {predicted_counts.get(1, 0)/len(df_submission)*100:.2f}%")
+    predicted_pos = int(predicted_counts.get(1, 0))
+    logger.info("==================================================")
+    logger.info("      FINAL TEST SUBMISSION PROFILE & METRICS     ")
+    logger.info("==================================================")
+    logger.info(f"  Applied Decision Threshold : {threshold:.5f}")
+    logger.info(f"  OOF Validation Recall      : {oof_metrics['recall']:.4f}")
+    logger.info(f"  OOF Validation Precision   : {oof_metrics['precision']:.4f}")
+    logger.info(f"  OOF Validation F2-Score    : {oof_metrics['f2']:.4f}")
+    logger.info(f"  OOF Validation PR-AUC      : {oof_metrics['pr_auc']:.4f}")
+    logger.info(f"  OOF False Negatives (FN)   : {oof_metrics['fn']}")
+    logger.info(f"  OOF False Positives (FP)   : {oof_metrics['fp']}")
+    logger.info(f"  Total Test Samples         : {len(df_submission)}")
+    logger.info(f"  Predicted Normal (0)       : {predicted_counts.get(0, 0)}")
+    logger.info(f"  Predicted Defect (1)       : {predicted_pos}")
+    logger.info(f"  Defect Rate                : {predicted_pos/len(df_submission)*100:.2f}%")
     
+    # Soft distribution monitoring against healthy range [35, 70]
+    if 35 <= predicted_pos <= 70:
+        logger.success(f"[HEALTHY] predicted defect count ({predicted_pos}) lies within the preferred [35, 70] range.")
+    else:
+        logger.warning(f"[MONITOR] predicted defect count ({predicted_pos}) is outside the preferred [35, 70] range (Generalization adaptive).")
+    logger.info("==================================================")
+
 if __name__ == '__main__':
     run_predictions()

@@ -1,19 +1,33 @@
 import os
 import numpy as np
 import joblib
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import average_precision_score
 
-from config import MODELS_DIR, PLOTS_DIR, SEED
+from config import MODELS_DIR, PLOTS_DIR, SEED, TARGET_COL
 from utils import SimpleLogger, seed_everything, calculate_metrics
-from threshold_optimizer import optimize_threshold
 from visualization import (
     plot_precision_recall_curve, plot_confusion_matrix,
-    plot_feature_importance, plot_precision_recall_vs_threshold
+    plot_precision_recall_vs_threshold
 )
+
+def calculate_f2(y_true, y_pred):
+    tp = np.sum(y_pred & (y_true == 1))
+    fp = np.sum(y_pred & (y_true == 0))
+    fn = np.sum(~y_pred & (y_true == 1))
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    
+    if (4 * precision + recall) > 0:
+        f2 = 5 * precision * recall / (4 * precision + recall)
+    else:
+        f2 = 0.0
+    return f2, precision, recall
 
 def run_ensembling():
     logger = SimpleLogger("SteelGuard-AI-Ensemble")
-    logger.info("Initializing Elite Ensemble Optimization...")
+    logger.info("Initializing Ultra-Safe Ensemble Optimization (Penalized F2)...")
     
     # Seed for reproducibility
     seed_everything(SEED)
@@ -27,113 +41,152 @@ def run_ensembling():
     oof_predictions = oof_data['oof_predictions']
     y_true = oof_data['y_true']
     
-    models = list(oof_predictions.keys())
-    n_models = len(models)
+    # Stratified 5-Fold setup to compute fold-wise metric variances
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    fold_splits = list(skf.split(np.zeros(len(y_true)), y_true))
     
-    logger.info(f"Loaded OOF predictions for models: {models}")
+    logger.info("Loaded OOF predictions for models: XGBoost and CatBoost")
     
-    # Generate OOF prediction matrix: shape (n_samples, n_models)
-    oof_matrix = np.column_stack([oof_predictions[m] for m in models])
+    # Grid search weight candidates: w_cat, w_xgb
+    # Bounded between [0.30, 0.70] and sum to 1.0 (No model dominance > 0.70)
+    weight_candidates = []
+    for w_cat in np.linspace(0.30, 0.70, 41):
+        w_xgb = 1.0 - w_cat
+        if 0.30 - 1e-9 <= w_xgb <= 0.70 + 1e-9:
+            weight_candidates.append([w_cat, w_xgb])
+            
+    logger.info(f"Generated {len(weight_candidates)} stable ensemble weight combinations bounded in [0.30, 0.70].")
     
-    # We will search for weights using Dirichlet distribution to generate random weights on the simplex (sum to 1)
-    np.random.seed(SEED)
-    n_trials = 3000
-    dirichlet_weights = np.random.dirichlet(alpha=np.ones(n_models), size=n_trials)
-    
-    # Add equal weights and single model weights as baselines
-    baselines = [np.ones(n_models) / n_models]  # Equal weights
-    for i in range(n_models):
-        w = np.zeros(n_models)
-        w[i] = 1.0
-        baselines.append(w)
-    
-    all_weights = np.vstack([baselines, dirichlet_weights])
-    
+    best_penalized_score = -9999.0
     best_weights = None
     best_threshold = 0.5
     best_recall = -1.0
     best_precision = -1.0
+    best_f2 = -1.0
+    best_recall_std = -1.0
+    best_precision_std = -1.0
+    best_sensitivity_penalty = -1.0
     
-    target_precision_constraint = 0.905  # 90.5% with 0.5% safety buffer for hidden leaderboard robustness
+    # Sweep thresholds strictly in [0.045, 0.07] narrow range for safety
+    thresholds_sweep = np.linspace(0.045, 0.07, 1001)
     
-    logger.info("Searching for optimal ensemble weights and threshold maximizing OOF Recall subject to Precision >= 90%...")
+    # Prepare arrays for fast search
+    cat_probs = oof_predictions['catboost']
+    xgb_probs = oof_predictions['xgboost']
     
-    n_pos = np.sum(y_true)
-    thresholds_sweep = np.linspace(0.01, 0.99, 199)
-    
-    for w in all_weights:
-        y_prob_blend = np.dot(oof_matrix, w)
+    for w in weight_candidates:
+        w_cat, w_xgb = w
+        # Blended soft voting probabilities
+        y_prob_blend = w_cat * cat_probs + w_xgb * xgb_probs
         
         for t in thresholds_sweep:
-            y_pred = (y_prob_blend >= t)
-            tp = np.sum(y_pred & (y_true == 1))
-            fp = np.sum(y_pred & (y_true == 0))
+            y_pred_blend = (y_prob_blend >= t).astype(int)
             
-            total_pred = tp + fp
-            if total_pred > 0:
-                prec = tp / total_pred
-                rec = tp / n_pos
+            # 1. Compute fold-wise metrics
+            fold_recalls = []
+            fold_precisions = []
+            
+            for train_idx, val_idx in fold_splits:
+                y_true_fold = y_true[val_idx]
+                y_pred_fold = y_pred_blend[val_idx]
                 
-                if prec >= target_precision_constraint:
-                    if rec > best_recall:
-                        best_recall = rec
-                        best_precision = prec
-                        best_weights = w
-                        best_threshold = t
-                    elif rec == best_recall and prec > best_precision:
-                        best_precision = prec
-                        best_weights = w
-                        best_threshold = t
-                        
-    # Fallback if no weight blend achieves Precision >= target_precision_constraint
-    if best_weights is None:
-        logger.warning("No weight blend achieved Precision >= 90.5%. Falling back to PR-AUC maximization.")
-        best_pr_auc = -1.0
-        for w in all_weights:
-            y_prob_blend = np.dot(oof_matrix, w)
-            pr_auc = average_precision_score(y_true, y_prob_blend)
-            if pr_auc > best_pr_auc:
-                best_pr_auc = pr_auc
+                tp = np.sum(y_pred_fold & (y_true_fold == 1))
+                fp = np.sum(y_pred_fold & (y_true_fold == 0))
+                fn = np.sum(~y_pred_fold & (y_true_fold == 1))
+                
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                
+                fold_recalls.append(rec)
+                fold_precisions.append(prec)
+                
+            recall_std = np.std(fold_recalls)
+            precision_std = np.std(fold_precisions)
+            
+            # Global F2
+            f2, prec, rec = calculate_f2(y_true, y_pred_blend)
+            
+            # 2. Compute Threshold Sensitivity Penalty: measure volatility at t +/- 0.005
+            f2_minus, _, _ = calculate_f2(y_true, (y_prob_blend >= max(0.001, t - 0.005)).astype(int))
+            f2_plus, _, _ = calculate_f2(y_true, (y_prob_blend >= min(0.999, t + 0.005)).astype(int))
+            sensitivity_penalty = np.std([f2_minus, f2, f2_plus])
+            
+            # Penalized F2 Score Formula
+            penalized_score = f2 - 0.5 * recall_std - 0.5 * precision_std - 1.0 * sensitivity_penalty
+            
+            # Tie breaking logic: prefer threshold closest to the middle of the range (0.0575)
+            is_better = False
+            if penalized_score > best_penalized_score + 1e-9:
+                is_better = True
+            elif abs(penalized_score - best_penalized_score) < 1e-9:
+                if abs(t - 0.0575) < abs(best_threshold - 0.0575):
+                    is_better = True
+                    
+            if is_better:
+                best_penalized_score = penalized_score
                 best_weights = w
-        
-        logger.info("Optimizing decision threshold on the fallback ensemble blend...")
-        best_y_prob_blend = np.dot(oof_matrix, best_weights)
-        best_threshold, best_metrics = optimize_threshold(y_true, best_y_prob_blend, target_precision=target_precision_constraint)
-    else:
-        logger.success("Found a precision-compliant ensembled configuration!")
-        best_y_prob_blend = np.dot(oof_matrix, best_weights)
-        best_threshold, best_metrics = optimize_threshold(y_true, best_y_prob_blend, target_precision=target_precision_constraint)
+                best_threshold = t
+                best_recall = rec
+                best_precision = prec
+                best_f2 = f2
+                best_recall_std = recall_std
+                best_precision_std = precision_std
+                best_sensitivity_penalty = sensitivity_penalty
+                
+    w_cat, w_xgb = best_weights
+    logger.success("Penalized Ensemble Weight Optimization Complete!")
+    logger.info(f"  Optimized Weights:")
+    logger.info(f"    CatBoost     : {w_cat:.4f}")
+    logger.info(f"    XGBoost      : {w_xgb:.4f}")
+    logger.info(f"  Optimized Decision Threshold (t*): {best_threshold:.5f}")
     
-    # Log the best ensemble configuration
-    weight_dict = {models[i]: float(best_weights[i]) for i in range(n_models)}
-    logger.info("Optimized Ensemble Weights:")
-    for model_name, weight in weight_dict.items():
-        logger.info(f"  {model_name:<15}: {weight:.4f}")
-        
-    logger.info(f"Optimized Threshold t*     : {best_threshold:.4f}")
-    logger.info(f"OOF Recall                 : {best_metrics['recall']:.4f}")
-    logger.info(f"OOF Precision              : {best_metrics['precision']:.4f}")
-    logger.info(f"OOF False Negatives (FN)   : {best_metrics['fn']}")
-    logger.info(f"OOF True Positives (TP)    : {best_metrics['tp']}")
-    logger.info(f"OOF False Positives (FP)   : {best_metrics['fp']}")
-    logger.info(f"OOF True Negatives (TN)    : {best_metrics['tn']}")
-    logger.info(f"OOF ROC AUC                : {best_metrics['auc']:.4f}")
+    # Calculate full metrics on best configuration
+    best_y_prob_blend = w_cat * cat_probs + w_xgb * xgb_probs
+    best_y_pred_blend = (best_y_prob_blend >= best_threshold).astype(int)
+    
+    best_metrics = calculate_metrics(y_true, best_y_pred_blend, best_y_prob_blend)
+    best_metrics['f2'] = best_f2
+    best_metrics['pr_auc'] = average_precision_score(y_true, best_y_prob_blend)
+    best_metrics['recall_fold_std'] = best_recall_std
+    best_metrics['precision_fold_std'] = best_precision_std
+    best_metrics['sensitivity_penalty'] = best_sensitivity_penalty
+    
+    logger.info("==================================================")
+    logger.info("      STABILITY-HARDENED OOF ENSEMBLE METRICS     ")
+    logger.info("==================================================")
+    logger.info(f"  OOF Recall                 : {best_recall:.4f}")
+    logger.info(f"  OOF Precision              : {best_precision:.4f}")
+    logger.info(f"  OOF F2-Score               : {best_f2:.4f}")
+    logger.info(f"  OOF PR-AUC                 : {best_metrics['pr_auc']:.4f}")
+    logger.info(f"  OOF Penalized Score        : {best_penalized_score:.4f}")
+    logger.info(f"  Fold Recall Std (Variance) : {best_recall_std:.4f}")
+    logger.info(f"  Fold Precision Std         : {best_precision_std:.4f}")
+    logger.info(f"  Threshold Sensitivity Std  : {best_sensitivity_penalty:.4f}")
+    logger.info(f"  OOF False Negatives (FN)   : {best_metrics['fn']}")
+    logger.info(f"  OOF True Positives (TP)    : {best_metrics['tp']}")
+    logger.info(f"  OOF False Positives (FP)   : {best_metrics['fp']}")
+    logger.info(f"  OOF True Negatives (TN)    : {best_metrics['tn']}")
+    logger.info(f"  OOF ROC AUC                : {best_metrics['auc']:.4f}")
+    logger.info("==================================================")
     
     # Save ensemble metadata
+    weight_dict = {
+        'catboost': float(w_cat),
+        'xgboost': float(w_xgb)
+    }
+    
     ensemble_metadata = {
         'weights': weight_dict,
         'threshold': float(best_threshold),
         'metrics': best_metrics,
-        'models_list': models
+        'models_list': ['catboost', 'xgboost']
     }
+    
     joblib.dump(ensemble_metadata, os.path.join(MODELS_DIR, 'ensemble_metadata.joblib'))
     joblib.dump(ensemble_metadata, os.path.join(MODELS_DIR, 'ensemble.pkl'))
     logger.success("Saved ensemble metadata to models/ensemble_metadata.joblib and models/ensemble.pkl")
     
     # Plot evaluations on OOF Blended probabilities
-    best_y_prob_blend = np.dot(oof_matrix, best_weights)
-    best_y_pred_blend = (best_y_prob_blend >= best_threshold).astype(float)
-    
     pr_curve_path = os.path.join(PLOTS_DIR, 'pr_curve.png')
     plot_precision_recall_curve(y_true, best_y_prob_blend, best_threshold, pr_curve_path)
     logger.success(f"Saved Precision-Recall curve to {pr_curve_path}")
@@ -141,21 +194,23 @@ def run_ensembling():
     cm_path = os.path.join(PLOTS_DIR, 'confusion_matrix.png')
     plot_confusion_matrix(y_true, best_y_pred_blend, cm_path)
     logger.success(f"Saved Confusion Matrix to {cm_path}")
-
-    # Plot threshold search graph
+    
     thresh_search_path = os.path.join(PLOTS_DIR, 'threshold_search_graph.png')
     plot_precision_recall_vs_threshold(y_true, best_y_prob_blend, thresh_search_path, opt_threshold=best_threshold)
     logger.success(f"Saved Threshold Search Graph to {thresh_search_path}")
-
-    # Plot feature importances
-    try:
-        final_features = joblib.load(os.path.join(MODELS_DIR, 'final_features.joblib'))
-        lgb_full = joblib.load(os.path.join(MODELS_DIR, 'lightgbm.pkl'))
-        feat_imp_path = os.path.join(PLOTS_DIR, 'feature_importance.png')
-        plot_feature_importance(lgb_full, final_features, feat_imp_path)
-        logger.success(f"Saved Feature Importance plot to {feat_imp_path}")
-    except Exception as e:
-        logger.warning(f"Could not generate feature importance plot: {str(e)}")
-
+    
+    # ==================================================
+    # PHASE 5: FALSE NEGATIVE MICRO-ANALYSIS
+    # ==================================================
+    logger.info("PHASE 5: Inspecting OOF False Negatives (FN) for repeatable pattern discovery...")
+    fn_indices = np.where((best_y_pred_blend == 0) & (y_true == 1))[0]
+    
+    if len(fn_indices) > 0:
+        logger.info(f"Found {len(fn_indices)} False Negatives. Displaying prediction profile:")
+        for idx in fn_indices[:10]:
+            logger.info(f"  OOF Sample {idx:4d} | True Class: 1 | Blend Prob: {best_y_prob_blend[idx]:.5f} | CatBoost: {cat_probs[idx]:.5f} | XGBoost: {xgb_probs[idx]:.5f} | Disagreement: {abs(cat_probs[idx] - xgb_probs[idx]):.5f}")
+    else:
+        logger.success("Zero False Negatives on OOF predictions!")
+        
 if __name__ == '__main__':
     run_ensembling()
